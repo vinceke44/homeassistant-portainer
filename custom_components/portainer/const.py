@@ -7,6 +7,7 @@ from homeassistant.const import Platform
 PLATFORMS = [
     Platform.SENSOR,
     Platform.BUTTON,
+    Platform.SWITCH,
 ]
 
 DOMAIN = "portainer"

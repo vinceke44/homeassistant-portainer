@@ -2,13 +2,13 @@
     "domain": "portainer",
     "name": "Portainer",
     "codeowners": [
-        "@tomaae"
+        "@vinceke44"
     ],
     "config_flow": true,
     "dependencies": [],
-    "documentation": "https://github.com/tomaae/homeassistant-portainer",
+    "documentation": "https://github.com/vinceke44/homeassistant-portainer",
     "iot_class": "local_polling",
-    "issue_tracker": "https://github.com/tomaae/homeassistant-portainer/issues",
+    "issue_tracker": "https://github.com/vinceke44/homeassistant-portainer/issues",
     "requirements": [],
-    "version": "0.0.1"
+    "version": "0.0.2"
 }
