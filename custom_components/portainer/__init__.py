@@ -7,6 +7,7 @@ from homeassistant.core import HomeAssistant
 
 from .const import DOMAIN, PLATFORMS
 from .coordinator import PortainerCoordinator
+from .services import async_register_services
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -33,6 +34,9 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> b
     coordinator = PortainerCoordinator(hass, config_entry)
     hass.data[DOMAIN][config_entry.entry_id]["coordinator"] = coordinator
     await coordinator.async_config_entry_first_refresh()
+
+    # Register Portainer control services (containers + stacks)
+    await async_register_services(hass, coordinator)
 
     await hass.config_entries.async_forward_entry_setups(config_entry, PLATFORMS)
 
