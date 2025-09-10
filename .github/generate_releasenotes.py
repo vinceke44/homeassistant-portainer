@@ -25,7 +25,7 @@ import sys
 from github import Github
 
 BODY = """
-[![Downloads for this release](https://img.shields.io/github/downloads/tomaae/homeassistant-portainer/{version}/total.svg)](https://github.com/vinceke44/homeassistant-portainer/releases/{version})
+[![Downloads for this release](https://img.shields.io/github/downloads/vinceke44/homeassistant-portainer/{version}/total.svg)](https://github.com/vinceke44/homeassistant-portainer/releases/{version})
 
 {changes}
 """
