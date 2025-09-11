@@ -23,6 +23,7 @@ Features:
 - List Containers
 - Check registry, for container updates
   - Public repos on docker and github are currently supported
+- Services and switches to control (start/stop/restart) containers 
 
 # Features
 
