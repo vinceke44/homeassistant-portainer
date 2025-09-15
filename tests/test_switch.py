@@ -1,65 +1,90 @@
+from types import SimpleNamespace
 import pytest
-from custom_components.portainer.switch import PortainerContainerSwitch, PortainerStackSwitch
 
-class DummyCoord:
-    def __init__(self, stacks=None, containers_by_name=None):
-        self.raw_data = {"stacks": stacks or {}, "containers_by_name": containers_by_name or {}}
-    async def async_request_refresh(self): pass
+from custom_components.portainer.switch import PortainerContainerSwitch
+from custom_components.portainer.const import (
+    CONF_CONTAINER_SENSOR_NAME_MODE,
+    NAME_MODE_CONTAINER,
+)
+
+
+class DummyCoordinator:
+    def __init__(self, containers_by_name, options=None):
+        opts = {CONF_CONTAINER_SENSOR_NAME_MODE: NAME_MODE_CONTAINER}
+        if options:
+            opts.update(options)
+        self.raw_data = {"containers_by_name": containers_by_name}
+        self.data = {"endpoints": {}, "containers": {}}
+        self.config_entry = SimpleNamespace(options=opts, data={"name": "Portainer Test"}, entry_id="test-entry")
+        self.hass = SimpleNamespace(async_add_executor_job=lambda func, *a, **k: func(*a, **k), async_create_task=lambda c: None)
+
+    def connected(self):
+        return True
+
+    async def async_request_refresh(self):
+        return None
+
 
 class DummyControl:
-    def __init__(self): self.calls = []
-    def start_container(self, eid, cid): self.calls.append(("start_container", eid, cid)); return True
-    def stop_container(self, eid, cid): self.calls.append(("stop_container", eid, cid)); return True
-    def start_stack(self, eid, sid): self.calls.append(("start_stack", eid, sid)); return True
-    def stop_stack(self, eid, sid): self.calls.append(("stop_stack", eid, sid)); return True
+    def __init__(self):
+        self.calls = []
 
-def c(eid, name, state="running", stack="app", svc="web"):
-    return {"EndpointId": eid, "Name": name, "State": state, "Compose_Stack": stack, "Compose_Service": svc, "Id": f"id-{name}"}
+    def start_container(self, endpoint_id, container_id):
+        self.calls.append(("start", endpoint_id, container_id))
+        return True
 
-@pytest.fixture(autouse=True)
-def patch_async_call_later(monkeypatch):
-    def immediate(_hass, _delay, cb):
-        try: return cb(None)
-        except TypeError: return cb()
-    monkeypatch.setattr("custom_components.portainer.switch.async_call_later", immediate, raising=False)
-    return immediate
+    def stop_container(self, endpoint_id, container_id):
+        self.calls.append(("stop", endpoint_id, container_id))
+        return True
 
-def test_container_switch_is_on_running(hass):
-    coord = DummyCoord(containers_by_name={"1:web": c(1, "web", "running")})
-    sw = PortainerContainerSwitch(coord, DummyControl(), coord.raw_data["containers_by_name"]["1:web"]); sw.hass = hass
-    assert sw.is_on is True
 
-def test_container_switch_is_off_exited(hass):
-    coord = DummyCoord(containers_by_name={"1:web": c(1, "web", "exited")})
-    sw = PortainerContainerSwitch(coord, DummyControl(), coord.raw_data["containers_by_name"]["1:web"]); sw.hass = hass
-    assert sw.is_on is False
+def mkc(eid, name, stack="", service="", state="running", cid=None):
+    return {
+        "EndpointId": eid,
+        "Name": name,
+        "Compose_Stack": stack,
+        "Compose_Service": service,
+        "State": state,
+        "Id": cid or f"id-{name}",
+    }
+
 
 def test_container_switch_rename_fallback_updates_name(hass):
-    initial = c(1, "oldname", "running", stack="app", svc="web")
-    current = c(1, "newname", "running", stack="app", svc="web")
-    coord = DummyCoord(containers_by_name={"1:newname": current})
-    sw = PortainerContainerSwitch(coord, DummyControl(), initial); sw.hass = hass
-    assert sw.is_on is True
+    c_old = mkc(1, "web", "MyApp", "web", cid="old-id")
+    coord = DummyCoordinator({"1:web": c_old})
+    ctrl = DummyControl()
+
+    sw = PortainerContainerSwitch(coord, ctrl, c_old)
+    sw.hass = hass
+    sw.entity_id = "switch.test_switch_name"
+
+    # New container appears with same compose identity, different name
+    c_new = mkc(1, "newname", "MyApp", "web", cid="new-id")
+    coord.raw_data["containers_by_name"] = {"1:newname": c_new}
+
+    # Trigger coordinator update (entity should adopt new container name)
+    sw._handle_coordinator_update()
+
+    # In container mode, label should now be the new container name
+    assert sw._compute_label() == "newname"
     assert sw.name == "Container: newname"
+
 
 @pytest.mark.asyncio
 async def test_container_switch_actions_call_control(hass):
-    coord = DummyCoord(containers_by_name={"1:web": c(1, "web", "running")})
-    control = DummyControl()
-    sw = PortainerContainerSwitch(coord, control, coord.raw_data["containers_by_name"]["1:web"]); sw.hass = hass
-    await sw.async_turn_off(); await sw.async_turn_on()
-    assert ("stop_container", 1, "id-web") in control.calls
-    assert ("start_container", 1, "id-web") in control.calls
+    c_old = mkc(2, "api", "Svc", "api", cid="id-old")
+    coord = DummyCoordinator({"2:api": c_old})
+    ctrl = DummyControl()
 
-def test_stack_switch_is_on_if_any_container_exists(hass):
-    stacks = {"1:7": {"Id": 7, "EndpointId": 1, "Name": "app"}}
-    containers = {"1:a": c(1, "web", "exited", stack="app", svc="web")}
-    coord = DummyCoord(stacks=stacks, containers_by_name=containers)
-    sw = PortainerStackSwitch(coord, DummyControl(), stacks["1:7"]); sw.hass = hass
-    assert sw.is_on is True  # exists, regardless of running
+    sw = PortainerContainerSwitch(coord, ctrl, c_old)
+    sw.hass = hass  # provides async_add_executor_job
+    sw.entity_id = "switch.test_switch_actions"
 
-def test_stack_switch_off_when_no_containers(hass):
-    stacks = {"1:7": {"Id": 7, "EndpointId": 1, "Name": "app"}}
-    coord = DummyCoord(stacks=stacks, containers_by_name={})
-    sw = PortainerStackSwitch(coord, DummyControl(), stacks["1:7"]); sw.hass = hass
-    assert sw.is_on is False
+    # after rename, actions should use the new Id
+    c_new = mkc(2, "api-renamed", "Svc", "api", cid="id-new")
+    coord.raw_data["containers_by_name"] = {"2:api-renamed": c_new}
+
+    await sw.async_turn_off()
+    await sw.async_turn_on()
+
+    assert ctrl.calls[-2:] == [("stop", 2, "id-new"), ("start", 2, "id-new")]

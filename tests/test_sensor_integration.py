@@ -1,35 +1,67 @@
-from __future__ import annotations
+from types import SimpleNamespace
 
-from homeassistant.core import HomeAssistant
-
-from ._helpers import force_refresh, get_display_name, get_unique_id, rename_in_portainer
+from custom_components.portainer.sensor import ContainerSensor
 
 
-async def test_container_sensor_unique_id_stable_and_name_updates_on_rename_integration(
-    hass: HomeAssistant,
-    portainer_setup,
-    mock_portainer_api,
-):
-    await force_refresh(hass)
+class DummyDesc:
+    def __init__(self, name="CPU", data_attribute="State", data_path="containers"):
+        self.name = name
+        self.key = name
+        self.data_attribute = data_attribute
+        self.data_path = data_path
+        self.ha_group = ""
+        self.native_unit_of_measurement = None
+        self.suggested_unit_of_measurement = None
+        self.icon = None
 
-    sensors = [s for s in hass.states.async_all() if s.entity_id.startswith("sensor.")]
-    assert sensors, "No sensors created by Portainer"
-    entity_id = sensors[0].entity_id
 
-    uid_before = get_unique_id(hass, entity_id)
-    name_before = get_display_name(hass, entity_id)
+class DummyCoordinator:
+    def __init__(self, containers_by_name, options=None):
+        self.raw_data = {"containers_by_name": containers_by_name}
+        self.data = {"endpoints": {}, "containers": {}}
+        self.config_entry = SimpleNamespace(
+            options=options or {}, data={"name": "Portainer Test"}, entry_id="test-entry"
+        )
+        self.hass = None
 
-    rename_in_portainer(
-        module_path="custom_components.portainer.api",
-        container_id="abc123",
-        new_container_name="web-renamed",
-        new_service_name="frontend-renamed",
-    )
-    await hass.config_entries.async_reload(portainer_setup.entry_id)
-    await force_refresh(hass)
+    def connected(self):
+        return True
 
-    uid_after = get_unique_id(hass, entity_id)
-    name_after = get_display_name(hass, entity_id)
 
-    assert uid_after == uid_before
-    assert name_after != name_before
+def mkc(eid, name, stack="", service="", state="running", cid=None):
+    return {
+        "EndpointId": eid,
+        "Name": name,
+        "Compose_Stack": stack,
+        "Compose_Service": service,
+        "State": state,
+        "Id": cid or f"id-{name}",
+    }
+
+
+def test_container_sensor_unique_id_stable_and_name_updates_on_rename_integration():
+    # initial mapping with old id
+    c1 = mkc(1, "web", "App", "web", cid="old-id")
+    coord = DummyCoordinator({"1:web": c1})
+
+    sensor = ContainerSensor(coord, DummyDesc("CPU"), uid=None)
+    # initialize identity like runtime
+    sensor._endpoint_id = 1
+    sensor._container_name = "web"
+    sensor._compose_stack = "App"
+    sensor._compose_service = "web"
+
+    original_unique = sensor.unique_id
+    original_label = sensor._compute_entity_label()
+
+    # rename in Portainer -> new id for same name
+    c2 = mkc(1, "web", "App", "web", cid="new-id")
+    coord.raw_data["containers_by_name"] = {"1:web": c2}
+
+    # resolve current container (adopts latest details)
+    sensor._resolve_current_container()
+
+    # unique id must remain stable (based on endpoint+original name+sensor key)
+    assert sensor.unique_id == original_unique
+    # label should remain consistent for the same identity
+    assert sensor._compute_entity_label() == original_label

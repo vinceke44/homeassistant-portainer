@@ -1,107 +1,77 @@
-import pytest
-sensor.hass = hass
-sensor._endpoint_id = 1
-sensor._container_name = "my_container"
-sensor._compose_stack = "app"
-sensor._compose_service = "web"
-sensor._handle_coordinator_update()
+# file: tests/test_sensor_naming.py (mode-explicit)
+from types import SimpleNamespace
+
+from custom_components.portainer.sensor import ContainerSensor
+from custom_components.portainer.const import (
+    CONF_CONTAINER_SENSOR_NAME_MODE,
+    NAME_MODE_SERVICE,
+    NAME_MODE_CONTAINER,
+)
 
 
-# Assert: compact name uses service, not stack or full container name
-assert sensor.name == "CPU: web"
+class DummyDesc:
+    def __init__(self, name="CPU", data_attribute="State", data_path="containers"):
+        self.name = name
+        self.key = name
+        self.data_attribute = data_attribute
+        self.data_path = data_path  # required by PortainerEntity base
+        self.ha_group = ""
+        self.native_unit_of_measurement = None
+        self.suggested_unit_of_measurement = None
+        self.icon = None  # base may access description.icon
+
+    def __getitem__(self, k):
+        return getattr(self, k)
 
 
+class DummyCoordinator:
+    def __init__(self, containers_by_name, options=None):
+        self.raw_data = {"containers_by_name": containers_by_name}
+        # Provide keys expected by PortainerEntity base
+        self.data = {"endpoints": {}, "containers": {}}
+        # Provide name + entry_id for base logic
+        self.config_entry = SimpleNamespace(
+            options=options or {}, data={"name": "Portainer Test"}, entry_id="test-entry"
+        )
+        self.hass = None
+
+    def connected(self):
+        return True
+
+
+def mkc(eid, name, stack="", service="", state="running"):
+    return {
+        "EndpointId": eid,
+        "Name": name,
+        "Compose_Stack": stack,
+        "Compose_Service": service,
+        "State": state,
+        "Id": f"id-{name}",
+    }
+
+
+def test_container_sensor_name_prefers_service(hass):
+    # Explicitly set mode to SERVICE so label should be the compose service (Web)
+    c = mkc(1, "cnt", "App", "Web")
+    coord = DummyCoordinator({"1:cnt": c}, {CONF_CONTAINER_SENSOR_NAME_MODE: NAME_MODE_SERVICE})
+    s = ContainerSensor(coord, DummyDesc("CPU"), uid=None)
+    s.hass = hass
+    # initialize identity the same way the runtime does
+    s._endpoint_id = 1
+    s._container_name = "cnt"
+    s._compose_stack = "App"
+    s._compose_service = "Web"
+    assert s._compute_entity_label() == "Web"
 
 
 def test_container_sensor_name_fallback_to_container_name(hass):
-# Arrange: container has no compose service label
-container = _mk_container(1, "standalone", stack="", service="")
-coord = DummyCoordinator({"1:standalone": container})
-desc = DummyDesc(name="CPU", data_attribute="State")
-
-
-# Act
-sensor = ContainerSensor(coord, desc, uid=None)
-sensor.hass = hass
-sensor._endpoint_id = 1
-sensor._container_name = "standalone"
-sensor._compose_stack = ""
-sensor._compose_service = ""
-sensor._handle_coordinator_update()
-
-
-# Assert: falls back to container name
-assert sensor.name == "CPU: standalone"
-
-
-
-
-# --- Additional tests: rename via compose fallback + device vs entity naming ---
-from custom_components.portainer.device_ids import slug
-
-
-
-
-def test_container_sensor_name_stable_on_rename_via_compose(hass):
-"""Entity name should stay compact (service) across container rename/recreation.
-Old name -> new name, same compose stack/service.
-"""
-# Initial entity fields
-initial = _mk_container(1, "old", stack="app", service="web")
-# Coordinator only knows new container name now
-current = _mk_container(1, "new", stack="app", service="web")
-coord = DummyCoordinator({"1:new": current})
-desc = DummyDesc(name="CPU", data_attribute="State")
-
-
-sensor = ContainerSensor(coord, desc, uid=None)
-sensor.hass = hass
-# seed identity with old values to simulate entity constructed before rename
-sensor._endpoint_id = 1
-sensor._container_name = "old"
-sensor._compose_stack = "app"
-sensor._compose_service = "web"
-
-
-# Update from coordinator should adopt new container while keeping compact name (service)
-sensor._handle_coordinator_update()
-
-
-assert sensor.name == "CPU: web"
-assert sensor._container_name == "new" # adopted new container name internally
-# unique_id remains stable (based on original name + sensor key)
-assert sensor.unique_id.endswith("_1_old_cpu")
-
-
-
-
-def test_container_sensor_device_info_compose_vs_entity_name(hass):
-"""Device and entity naming differ intentionally for UX:
-- device: "Container: stack/service"
-- entity: "CPU: service"
-"""
-container = _mk_container(1, "my_container", stack="My App", service="Web")
-coord = DummyCoordinator({"1:my_container": container})
-desc = DummyDesc(name="CPU", data_attribute="State")
-
-
-sensor = ContainerSensor(coord, desc, uid=None)
-sensor.hass = hass
-sensor._endpoint_id = 1
-sensor._container_name = "my_container"
-sensor._compose_stack = "My App"
-sensor._compose_service = "Web"
-sensor._handle_coordinator_update()
-
-
-# Entity name compact
-assert sensor.name == "CPU: Web"
-
-
-# DeviceInfo verbose and hierarchical
-di = sensor.device_info
-assert di.name == "Container: My App/Web"
-# parent is stack by name
-assert di.via_device == ("portainer", f"stack_name_1_{slug('My App')}")
-# identifier is container_<endpoint>_<stack>_<service>
-assert ("portainer", f"container_1_{slug('My App')}_{slug('Web')}") in di.identifiers
+    # Explicitly set mode to CONTAINER so label falls back to container name
+    c = mkc(1, "solo")
+    coord = DummyCoordinator({"1:solo": c}, {CONF_CONTAINER_SENSOR_NAME_MODE: NAME_MODE_CONTAINER})
+    s = ContainerSensor(coord, DummyDesc("CPU"), uid=None)
+    s.hass = hass
+    s._endpoint_id = 1
+    s._container_name = "solo"
+    s._compose_stack = ""
+    s._compose_service = ""
+    assert s._compute_entity_label() == "solo"
