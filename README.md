@@ -18,12 +18,14 @@
 Monitor and control Portainer from Home Assistant.
 
 Features:
+- Services and switches to control (start/stop/restart) containers and stacks
+-  container metrics (currently CPU and memory) sensors
 
 - List Endpoints
 - List Containers
 - Check registry, for container updates
   - Public repos on docker and github are currently supported
-- Services and switches to control (start/stop/restart) containers 
+
 
 # Features
 
