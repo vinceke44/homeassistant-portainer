@@ -53,7 +53,6 @@ class PortainerAPI(object):
     def connection_test(self) -> tuple:
         """Test connection."""
         self.query("endpoints")
-
         return self._connected, self._error
 
     # ---------------------------
@@ -61,7 +60,7 @@ class PortainerAPI(object):
     # ---------------------------
     def query(
         self, service: str, method: str = "get", params: dict[str, Any] | None = None
-    ) -> list | None:
+    ) -> Any | None:
         """Retrieve data from Portainer."""
         if params is None:
             params = {}
@@ -89,7 +88,6 @@ class PortainerAPI(object):
                     verify=self._ssl_verify,
                     timeout=10,
                 )
-
             elif method == "post":
                 response = requests_post(
                     f"{self._url}{service}",
@@ -138,6 +136,43 @@ class PortainerAPI(object):
         self.lock.release()
 
         return data
+
+    # ---------------------------
+    #   get_container_stats
+    # ---------------------------
+    def get_container_stats(
+        self, *, endpoint_id: int | str, container_id: str
+    ) -> Any | None:
+        """One-shot Docker stats for a container (no stream, read-only).
+        IMPORTANT: This call MUST NOT toggle global connected state on per-container errors.
+        Returns JSON dict on 200, otherwise None.
+        """
+        service = f"endpoints/{endpoint_id}/docker/containers/{container_id}/stats"
+        url = f"{self._url}{service}"
+        headers = {
+            "Content-Type": "application/json",
+            "X-API-Key": f"{self._api_key}",
+        }
+        try:
+            resp = requests_get(
+                url,
+                headers=headers,
+                params={"stream": "false"},
+                verify=self._ssl_verify,
+                timeout=10,
+            )
+            if resp is not None and resp.status_code == 200:
+                return resp.json()
+            # Do NOT flip _connected here; per-container stats often 404/409 when stopped
+            _LOGGER.debug(
+                "Portainer stats non-200 for %s: %s",
+                container_id,
+                getattr(resp, "status_code", "no_response"),
+            )
+            return None
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("Portainer stats error for %s: %s", container_id, err)
+            return None
 
     @property
     def error(self):

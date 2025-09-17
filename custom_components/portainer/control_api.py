@@ -1,4 +1,3 @@
-# file: custom_components/portainer/control_api.py
 """Portainer Control API.
 
 Thin, robust wrappers around Portainer actions (containers & stacks).

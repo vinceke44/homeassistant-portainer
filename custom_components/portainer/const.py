@@ -1,4 +1,5 @@
 """Constants used by the Portainer integration."""
+from __future__ import annotations
 
 from typing import Final
 
@@ -35,7 +36,7 @@ TO_REDACT = {
 
 CUSTOM_ATTRIBUTE_ARRAY = "_Custom"
 
-# === New: sensor naming mode (for container sensors) ===
+# sensor naming mode
 CONF_CONTAINER_SENSOR_NAME_MODE = "container_sensor_name_mode"
 
 NAME_MODE_SERVICE = "service"           # prefer compose service; fallback to container name
@@ -43,6 +44,23 @@ NAME_MODE_CONTAINER = "container"       # always container name
 NAME_MODE_STACK_SERVICE = "stack_service"  # compose "stack/service"; fallback to container name
 
 DEFAULT_CONTAINER_SENSOR_NAME_MODE = NAME_MODE_SERVICE
+
+
+# Stats polling options (stored in ConfigEntry.options)
+CONF_STATS_SCAN_INTERVAL: str = "stats_scan_interval"
+DEFAULT_STATS_SCAN_INTERVAL: int = 15  # seconds
+
+CONF_STATS_SMOOTHING_ALPHA: str = "stats_smoothing_alpha"
+DEFAULT_STATS_SMOOTHING_ALPHA: float = 0.2  # 0 disables smoothing
+
+CONF_MEM_EXCLUDE_CACHE: str = "stats_memory_exclude_cache"
+DEFAULT_MEM_EXCLUDE_CACHE: bool = True
+
+# Stable suffixes appended to the per-container unique_id root
+UNIQUE_SUFFIX_CPU_PCT: str = "cpu_pct"
+UNIQUE_SUFFIX_MEM_MIB: str = "mem_mib"
+UNIQUE_SUFFIX_MEM_PCT: str = "mem_pct"
+
 
 # feature switch
 CONF_FEATURE_HEALTH_CHECK: Final = "feature_switch_health_check"

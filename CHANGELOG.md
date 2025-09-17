@@ -1,4 +1,37 @@
 # Changelog
+v1.2.0 — CPU & Memory stats for containers (2025‑09‑17)
+
+Added
+	•	Per‑container CPU Usage (%)
+	•	Formula: ((cpu_delta / system_delta) * online_cpus * 100)
+	•	Device class: power_factor, state class: measurement, unit: %.
+	•	Icon: mdi:cpu-64-bit (from sensor_types.py).
+	•	Entity naming honors container_sensor_name_mode (service | container | stack/service).
+	•	Per‑container Memory Used (MiB)
+	•	Device class: data_size, state class: measurement, unit: MiB.
+	•	Optional cache exclusion via CONF_MEM_EXCLUDE_CACHE.
+	•	Icon: mdi:memory (from sensor_types.py).
+	•	Per‑container Memory Usage (%)
+	•	Device class: power_factor, state class: measurement, unit: %.
+
+Options
+	•	Stats polling: CONF_STATS_SCAN_INTERVAL (default from const.py).
+	•	CPU smoothing: CONF_STATS_SMOOTHING_ALPHA (EWMA; set 0 to disable).
+	•	Memory cache exclusion: CONF_MEM_EXCLUDE_CACHE (true/false).
+
+Fixed
+	•	Stack container sensors reliably restore after HA restart.
+	•	Update path now only skips entities already active on the platform, so restored registry entries are correctly re‑instantiated.
+	•	Fallback synthesis of stacks from Compose labels when Portainer /stacks is empty.
+	•	Stack sensors enabled by default.
+
+Changed
+	•	Stats sensors now use icons defined in sensor_types.py for consistency.
+
+Performance
+	•	Introduced a lightweight per‑container StatsCoordinator
+	•	Shared by CPU%, Mem (MiB), Mem% sensors for the same container.
+	•	Non‑blocking startup: base entities added first; stats refresh scheduled asynchronously.
 
 ## [1.1.0]
 ### Added

@@ -4,6 +4,9 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import timedelta
+from dataclasses import dataclass
+from functools import partial
+from typing import Any, Dict, Optional
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
@@ -30,6 +33,13 @@ from .const import (
     DEFAULT_FEATURE_UPDATE_CHECK,
     DOMAIN,
     SCAN_INTERVAL,
+    # --- stats options ---
+    CONF_STATS_SCAN_INTERVAL,
+    DEFAULT_STATS_SCAN_INTERVAL,
+    CONF_STATS_SMOOTHING_ALPHA,
+    DEFAULT_STATS_SMOOTHING_ALPHA,
+    CONF_MEM_EXCLUDE_CACHE,
+    DEFAULT_MEM_EXCLUDE_CACHE,
 )
 from .portainer_update_service import PortainerUpdateService
 
@@ -84,7 +94,7 @@ class PortainerCoordinator(DataUpdateCoordinator):
         self.raw_data: dict[str, dict] = {
             "endpoints": {},
             "containers": {},         # flattened by container ID (legacy)
-            "containers_by_name": {}, # NEW: flattened by endpoint+name (stable)
+            "containers_by_name": {}, # flattened by endpoint+name
             "stacks": {},
         }
 
@@ -216,7 +226,7 @@ class PortainerCoordinator(DataUpdateCoordinator):
                 )
 
         # legacy: flattened by container ID
-        flat_by_id = self._flatten_containers_dict_by_id(self.raw_data["containers"]) 
+        flat_by_id = self._flatten_containers_dict_by_id(self.raw_data["containers"])
         self.raw_data["containers"] = flat_by_id
 
         # NEW: stable index by endpoint+name
@@ -389,13 +399,19 @@ class PortainerCoordinator(DataUpdateCoordinator):
                 {"name": "Type", "default": 0},
             ],
         )
+
+        # If API yields nothing, build from compose labels as fallback
         if not stacks_map:
+            _LOGGER.info(
+                "Portainer: 'stacks' API returned no data; building synthetic stacks from compose labels"
+            )
+            self.raw_data["stacks"] = self._fallback_stacks_from_containers()
             return
 
         online_endpoints = {
             eid for eid, e in self.raw_data["endpoints"].items() if e.get("Status") == 1
         }
-        grouped: dict[int, dict] = {}
+        grouped: dict[int | str, dict] = {}
         for sid, stack in stacks_map.items():
             eid = stack.get("EndpointId")
             if eid not in online_endpoints:
@@ -407,6 +423,16 @@ class PortainerCoordinator(DataUpdateCoordinator):
             stack["ConfigEntryId"] = self.config_entry_id
             grouped.setdefault(eid, {})[sid] = stack
 
+        if not grouped:
+            # All stacks filtered out -> also fallback
+            self.raw_data["stacks"] = self._fallback_stacks_from_containers()
+            if self.raw_data["stacks"]:
+                _LOGGER.info(
+                    "Portainer: built %s synthetic stacks from compose labels",
+                    len(self.raw_data["stacks"]),
+                )
+            return
+
         self.raw_data["stacks"] = {
             f"{eid}:{sid}": v for eid, sd in grouped.items() for sid, v in sd.items()
         }
@@ -415,3 +441,207 @@ class PortainerCoordinator(DataUpdateCoordinator):
             sum(len(v) for v in grouped.values()),
             len(grouped),
         )
+
+    def _fallback_stacks_from_containers(self) -> dict[str, dict]:
+        """Synthesize stacks from container compose labels when Portainer 'stacks' API is empty.
+        Keyed as f"{EndpointId}:{synthetic_id}" with:
+          - Id: 'synth-<EndpointId>:<StackName>'
+          - Name: <Compose_Stack>
+        """
+        result: dict[str, dict] = {}
+        flat = self.raw_data.get("containers", {}) or {}
+        if not flat:
+            return result
+
+        for c in flat.values():
+            eid = c.get("EndpointId")
+            stack_name = (c.get("Compose_Stack") or "").strip()
+            if not eid or not stack_name:
+                continue
+            synth_id = f"synth-{eid}:{stack_name}"
+            key = f"{eid}:{synth_id}"
+            if key in result:
+                continue
+            endpoint = (self.raw_data.get("endpoints") or {}).get(eid) or {}
+            result[key] = {
+                "Id": synth_id,
+                "Name": stack_name,
+                "EndpointId": eid,
+                "Type": 0,
+                "Environment": endpoint.get("Name", ""),
+                "ConfigEntryId": self.config_entry_id,
+            }
+
+        return result
+
+
+# ===================================================================
+# Per-container stats coordinator (CPU% / Memory), cached by container
+# ===================================================================
+
+def _safe_get(dct: Dict[str, Any], *path: str, default: Any | None = None) -> Any:
+    cur: Any = dct
+    for key in path:
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(key)
+        if cur is None:
+            return default
+    return cur
+
+
+def compute_cpu_percent(stats: Dict[str, Any]) -> float:
+    """Docker CPU% formula; returns 0.0 when data is insufficient."""
+    cpu_total = _safe_get(stats, "cpu_stats", "cpu_usage", "total_usage", default=0) or 0
+    precpu_total = _safe_get(stats, "precpu_stats", "cpu_usage", "total_usage", default=0) or 0
+    system_cpu = _safe_get(stats, "cpu_stats", "system_cpu_usage", default=0) or 0
+    pre_system_cpu = _safe_get(stats, "precpu_stats", "system_cpu_usage", default=0) or 0
+    cpu_delta = cpu_total - precpu_total
+    system_delta = system_cpu - pre_system_cpu
+    if cpu_delta <= 0 or system_delta <= 0:
+        return 0.0
+    online_cpus = (
+        _safe_get(stats, "cpu_stats", "online_cpus")
+        or len(_safe_get(stats, "cpu_stats", "cpu_usage", "percpu_usage", default=[]) or [])
+        or 1
+    )
+    return float((cpu_delta / system_delta) * online_cpus * 100.0)
+
+
+def compute_memory_used_bytes(stats: Dict[str, Any], *, exclude_cache: bool = True) -> int:
+    """Memory used; subtract cache/inactive_file when requested to reflect pressure."""
+    usage = int(_safe_get(stats, "memory_stats", "usage", default=0) or 0)
+    if not exclude_cache:
+        return max(usage, 0)
+    cache = int(_safe_get(stats, "memory_stats", "stats", "cache", default=0) or 0)
+    if cache == 0:
+        cache = int(_safe_get(stats, "memory_stats", "stats", "inactive_file", default=0) or 0)
+    return max(usage - cache, 0)
+
+
+def compute_memory_percent(stats: Dict[str, Any], used_bytes: int) -> float:
+    limit = int(_safe_get(stats, "memory_stats", "limit", default=0) or 0)
+    if limit <= 0:
+        return 0.0
+    return float((used_bytes / limit) * 100.0)
+
+
+@dataclass(slots=True)
+class ContainerStatsData:
+    """Computed stats cached by the stats coordinator."""
+    cpu_percent: float
+    mem_used_bytes: int
+    mem_used_mib: float
+    mem_percent: float
+    raw: Dict[str, Any]
+
+
+class ContainerStatsCoordinator(DataUpdateCoordinator[ContainerStatsData]):
+    """Per-container stats poller shared by three sensors.
+    Keyed by a stable container key to survive renames/recreates.
+    """
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        *,
+        api: PortainerAPI,
+        entry_id: str,
+        endpoint_id: int | str,
+        container_id: str,
+        container_key: str,
+        options: Dict[str, Any] | None = None,
+    ) -> None:
+        self._api = api
+        self._endpoint_id = endpoint_id
+        self._container_id = container_id
+        self._container_key = container_key
+        self._alpha: float = (options or {}).get(CONF_STATS_SMOOTHING_ALPHA, DEFAULT_STATS_SMOOTHING_ALPHA)
+        self._exclude_cache: bool = (options or {}).get(CONF_MEM_EXCLUDE_CACHE, DEFAULT_MEM_EXCLUDE_CACHE)
+        interval_seconds: int = int((options or {}).get(CONF_STATS_SCAN_INTERVAL, DEFAULT_STATS_SCAN_INTERVAL))
+        super().__init__(
+            hass,
+            logger=_LOGGER,
+            name=f"{DOMAIN}_container_stats:{entry_id}:{container_key}",
+            update_interval=timedelta(seconds=interval_seconds),
+        )
+        self._last_cpu: Optional[float] = None
+        self._last: Optional[ContainerStatsData] = None
+
+    async def _async_update_data(self) -> ContainerStatsData:
+        # Fetch stats; None on per-container errors/stopped containers
+        stats: Dict[str, Any] | None = await self.hass.async_add_executor_job(
+            partial(
+                self._api.get_container_stats,
+                endpoint_id=self._endpoint_id,
+                container_id=self._container_id,
+            )
+        )
+        if not stats:
+            # Keep last values if we have them; otherwise return zeros
+            if self._last is not None:
+                return self._last
+            zeros = ContainerStatsData(
+                cpu_percent=0.0,
+                mem_used_bytes=0,
+                mem_used_mib=0.0,
+                mem_percent=0.0,
+                raw={},
+            )
+            self._last = zeros
+            return zeros
+
+        cpu = compute_cpu_percent(stats)
+        if self._alpha and self._alpha > 0:
+            self._last_cpu = cpu if self._last_cpu is None else (self._alpha * cpu) + ((1 - self._alpha) * self._last_cpu)
+            cpu_out = float(self._last_cpu)
+        else:
+            cpu_out = float(cpu)
+
+        used_bytes = compute_memory_used_bytes(stats, exclude_cache=self._exclude_cache)
+        mem_mib = float(used_bytes / 1048576.0)
+        mem_pct = compute_memory_percent(stats, used_bytes)
+
+        data = ContainerStatsData(
+            cpu_percent=cpu_out,
+            mem_used_bytes=used_bytes,
+            mem_used_mib=mem_mib,
+            mem_percent=mem_pct,
+            raw=stats,
+        )
+        self._last = data
+        return data
+
+
+def get_or_create_container_stats_coordinator(
+    hass: HomeAssistant,
+    *,
+    entry_id: str,
+    api: PortainerAPI,
+    endpoint_id: int | str,
+    container_key: str,
+    container_id: str,
+    options: Dict[str, Any] | None,
+) -> ContainerStatsCoordinator:
+    """Return cached coordinator under hass.data[DOMAIN][entry_id]['stats_coordinators']."""
+    registry: Dict[str, Any] = hass.data.setdefault(DOMAIN, {})
+    entry_ns: Dict[str, Any] = registry.setdefault(entry_id, {})
+    stats_ns: Dict[str, Any] = entry_ns.setdefault("stats_coordinators", {})
+
+    if container_key in stats_ns:
+        coord: ContainerStatsCoordinator = stats_ns[container_key]
+        # update container id on recreate/rename (keep same stable key)
+        coord._container_id = container_id  # noqa: SLF001
+        return coord
+
+    coord = ContainerStatsCoordinator(
+        hass,
+        api=api,
+        entry_id=entry_id,
+        endpoint_id=endpoint_id,
+        container_id=container_id,
+        container_key=container_key,
+        options=options or {},
+    )
+    stats_ns[container_key] = coord
+    return coord

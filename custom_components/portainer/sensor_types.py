@@ -8,6 +8,12 @@ from typing import List
 from homeassistant.components.sensor import SensorEntityDescription
 
 from .const import CUSTOM_ATTRIBUTE_ARRAY
+from .const import (
+    UNIQUE_SUFFIX_CPU_PCT,
+    UNIQUE_SUFFIX_MEM_MIB,
+    UNIQUE_SUFFIX_MEM_PCT,
+)
+
 
 DEVICE_ATTRIBUTES_ENDPOINTS = [
     "Type",
@@ -101,6 +107,49 @@ SENSOR_TYPES: tuple[PortainerSensorEntityDescription, ...] = (
         data_reference="",  # No reference = single entity
         data_attributes_list=[],
         func="UpdateCheckSensor",
+    ),
+    # ---- Per-container live stats (CPU% / Memory) ----
+    PortainerSensorEntityDescription(
+        key=f"containers_{UNIQUE_SUFFIX_CPU_PCT}",
+        name="CPU Usage (%)",
+        icon="mdi:cpu-64-bit",
+        entity_category=None,
+        ha_group="data__EndpointId",
+        data_path="containers",      # iterate the flat-by-id mapping
+        data_attribute=None,         # not used in with-reference flow
+        data_name="Name",
+        data_uid="",
+        data_reference="Id",         # metadata; uid comes from dict key
+        data_attributes_list=DEVICE_ATTRIBUTES_CONTAINERS,
+        func="ContainerStatsSensor", # dispatcher hook in sensor.py
+    ),
+    PortainerSensorEntityDescription(
+        key=f"containers_{UNIQUE_SUFFIX_MEM_MIB}",
+        name="Memory Used (MiB)",
+        icon="mdi:memory",
+        entity_category=None,
+        ha_group="data__EndpointId",
+        data_path="containers",
+        data_attribute=None,
+        data_name="Name",
+        data_uid="",
+        data_reference="Id",
+        data_attributes_list=DEVICE_ATTRIBUTES_CONTAINERS,
+        func="ContainerStatsSensor",
+    ),
+    PortainerSensorEntityDescription(
+        key=f"containers_{UNIQUE_SUFFIX_MEM_PCT}",
+        name="Memory Usage (%)",
+        icon="mdi:memory",
+        entity_category=None,
+        ha_group="data__EndpointId",
+        data_path="containers",
+        data_attribute=None,
+        data_name="Name",
+        data_uid="",
+        data_reference="Id",
+        data_attributes_list=DEVICE_ATTRIBUTES_CONTAINERS,
+        func="ContainerStatsSensor",
     ),
 )
 

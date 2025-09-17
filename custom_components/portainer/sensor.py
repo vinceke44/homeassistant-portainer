@@ -1,3 +1,4 @@
+# custom_components/portainer/sensor.py
 """Portainer sensor platform."""
 from __future__ import annotations
 
@@ -5,9 +6,13 @@ import asyncio
 from datetime import date, datetime
 from decimal import Decimal
 from logging import getLogger
-from typing import Any
+from typing import Any, Optional, Callable, Dict
 
-from homeassistant.components.sensor import SensorEntity
+from homeassistant.components.sensor import (
+    SensorEntity,
+    SensorDeviceClass,
+)
+from homeassistant.components.sensor.const import SensorStateClass
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import entity_platform as ep
@@ -17,6 +22,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import StateType
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
+from homeassistant.const import PERCENTAGE, UnitOfInformation
 
 from .const import (
     CONF_FEATURE_UPDATE_CHECK,
@@ -27,9 +33,23 @@ from .const import (
     NAME_MODE_SERVICE,
     NAME_MODE_CONTAINER,
     NAME_MODE_STACK_SERVICE,
+    # --- stats config + suffixes ---
+    CONF_STATS_SCAN_INTERVAL,
+    DEFAULT_STATS_SCAN_INTERVAL,
+    CONF_STATS_SMOOTHING_ALPHA,
+    DEFAULT_STATS_SMOOTHING_ALPHA,
+    CONF_MEM_EXCLUDE_CACHE,
+    DEFAULT_MEM_EXCLUDE_CACHE,
+    UNIQUE_SUFFIX_CPU_PCT,
+    UNIQUE_SUFFIX_MEM_MIB,
+    UNIQUE_SUFFIX_MEM_PCT,
 )
 
-from .coordinator import PortainerCoordinator
+from .coordinator import (
+    PortainerCoordinator,
+    ContainerStatsCoordinator,
+    get_or_create_container_stats_coordinator,
+)
 from .device_ids import container_device_info, stack_device_info
 from .entity import PortainerEntity, create_sensors
 from .sensor_types import SENSOR_SERVICES, SENSOR_TYPES  # noqa: F401
@@ -77,9 +97,30 @@ async def async_setup_entry(
         )
 
     unique_entities = _filter_unique_entities(entities)
-    async_add_entities_callback(unique_entities, update_before_add=True)
 
-    # Add stack container count sensors (one per stack)
+    # Avoid blocking startup on /stats calls: add base first (with refresh), stats later (no blocking)
+    base_entities = [
+        e for e in unique_entities if not isinstance(e, PortainerContainerStatsSensor)
+    ]
+    stats_entities = [
+        e for e in unique_entities if isinstance(e, PortainerContainerStatsSensor)
+    ]
+
+    if base_entities:
+        async_add_entities_callback(base_entities, update_before_add=True)
+
+    if stats_entities:
+        async_add_entities_callback(stats_entities, update_before_add=False)
+        for e in stats_entities:
+            try:
+                e.coordinator.async_request_refresh()
+            except Exception:  # pragma: no cover
+                _LOGGER.debug(
+                    "Could not schedule initial stats refresh for %s",
+                    getattr(e, "unique_id", "?"),
+                )
+
+    # Add stack container count sensors (one per stack); with compose-label fallback
     stack_sensors = _create_stack_sensors(coordinator)
     _LOGGER.info(
         "Initial sensor setup: Added %d stack container sensors", len(stack_sensors)
@@ -115,6 +156,8 @@ def _get_dispatcher():
         "UpdateCheckSensor": UpdateCheckSensor,
         "EndpointSensor": EndpointSensor,
         "ContainerSensor": ContainerSensor,
+        # New: per-container stats (CPU/Mem) via dedicated factory below
+        "ContainerStatsSensor": _container_stats_factory,
     }
 
 
@@ -158,21 +201,15 @@ async def _handle_update_controller(
     dispatcher,
     async_add_entities_callback,
 ):
-    from homeassistant.helpers import entity_registry as er
-
-    entity_registry = er.async_get(hass)
-    existing_entities_in_registry = er.async_entries_for_config_entry(
-        entity_registry, config_entry.entry_id
-    )
-    existing_unique_ids = _get_existing_unique_ids(existing_entities_in_registry)
-
+    # IMPORTANT FIX: only consider entities that are ACTIVE on the platform.
+    # Do NOT skip adding based solely on registry presence, or restored entries
+    # will remain unavailable after restart.
     platform_entities, platform_unique_ids = _get_platform_entities_and_ids(platform)
-    existing_unique_ids.update(platform_unique_ids)
+
     _LOGGER.debug(
-        "async_update_controller: registry=%d entities, platform=%d entities, total_unique_ids=%d",
-        len(existing_entities_in_registry),
+        "async_update_controller: platform=%d entities, active_unique_ids=%d",
         len(platform_entities),
-        len(existing_unique_ids),
+        len(platform_unique_ids),
     )
 
     entities = create_sensors(coordinator, descriptions, dispatcher)
@@ -180,11 +217,11 @@ async def _handle_update_controller(
         "Update controller: create_sensors returned %d entities",
         len(entities),
     )
-    new_entities = _find_new_entities(entities, existing_unique_ids)
+    new_entities = _find_new_entities(entities, platform_unique_ids)
 
     # Also build stack container sensors (running/total) and filter new ones
     stack_candidates = _create_stack_sensors(coordinator)
-    new_stack_sensors = _find_new_entities(stack_candidates, existing_unique_ids)
+    new_stack_sensors = _find_new_entities(stack_candidates, platform_unique_ids)
 
     await hass.async_add_executor_job(lambda: None)
 
@@ -197,7 +234,28 @@ async def _handle_update_controller(
             len(new_stack_sensors),
         )
         if new_entities:
-            async_add_entities_callback(new_entities, update_before_add=True)
+            base_new = [
+                e
+                for e in new_entities
+                if not isinstance(e, PortainerContainerStatsSensor)
+            ]
+            stats_new = [
+                e for e in new_entities if isinstance(e, PortainerContainerStatsSensor)
+            ]
+
+            if base_new:
+                async_add_entities_callback(base_new, update_before_add=True)
+            if stats_new:
+                async_add_entities_callback(stats_new, update_before_add=False)
+                for e in stats_new:
+                    try:
+                        e.coordinator.async_request_refresh()
+                    except Exception:  # pragma: no cover
+                        _LOGGER.debug(
+                            "Could not schedule initial stats refresh for %s",
+                            getattr(e, "unique_id", "?"),
+                        )
+
         if new_stack_sensors:
             _LOGGER.info("Adding %d new stack sensors", len(new_stack_sensors))
             async_add_entities_callback(new_stack_sensors, update_before_add=True)
@@ -207,14 +265,6 @@ async def _handle_update_controller(
             async_add_entities_callback(new_stack_sensors, update_before_add=True)
         else:
             _LOGGER.debug("No new entities to add")
-
-
-def _get_existing_unique_ids(existing_entities_in_registry):
-    return {
-        entity.unique_id
-        for entity in existing_entities_in_registry
-        if entity.unique_id and entity.platform == "portainer"
-    }
 
 
 def _get_platform_entities_and_ids(platform):
@@ -252,7 +302,7 @@ def _find_new_entities(entities, existing_unique_ids):
             continue
         if unique_id in existing_unique_ids:
             _LOGGER.debug(
-                "Skipping existing entity: %s (name: %s, type: %s)",
+                "Skipping existing ACTIVE entity: %s (name: %s, type: %s)",
                 unique_id,
                 entity_name,
                 type(entity).__name__,
@@ -266,10 +316,34 @@ def _find_new_entities(entities, existing_unique_ids):
 
 
 def _create_stack_sensors(coordinator: PortainerCoordinator):
-    """Build StackContainersSensor instances for each known stack."""
-    stacks = coordinator.raw_data.get("stacks", {})
+    """Build StackContainersSensor instances for each known stack.
+    If none reported by API, synthesize from container compose labels.
+    """
+    stacks_map: Dict[str, dict] = coordinator.raw_data.get("stacks", {}) or {}
+
+    # Fallback: synthesize stacks from containers by compose project label
+    if not stacks_map:
+        containers_by_name = coordinator.raw_data.get("containers_by_name", {}) or {}
+        synth: Dict[str, dict] = {}
+        for c in containers_by_name.values():
+            eid = c.get("EndpointId")
+            stack_name = (c.get("Compose_Stack") or "").strip()
+            if not eid or not stack_name:
+                continue
+            synth_id = f"synth-{eid}:{stack_name}"
+            key = f"{eid}:{synth_id}"
+            if key not in synth:
+                synth[key] = {
+                    "Id": synth_id,
+                    "Name": stack_name,
+                    "EndpointId": eid,
+                }
+        if synth:
+            _LOGGER.info("Synthesized %d stacks from compose labels", len(synth))
+        stacks_map = synth
+
     sensors = []
-    for stack in stacks.values():
+    for stack in stacks_map.values():
         try:
             sensors.append(StackContainersSensor(coordinator, stack))
         except Exception as err:  # noqa: BLE001
@@ -495,16 +569,19 @@ class ContainerSensor(PortainerSensor):
         self._refresh_metadata()
         super()._handle_coordinator_update()
 
+
 # ---------------------------
 #   StackContainersSensor
 # ---------------------------
 class StackContainersSensor(CoordinatorEntity, SensorEntity):
     """Sensor reporting running/total containers for a Portainer stack."""
 
+    _attr_entity_registry_enabled_default = True  # ensure enabled by default
+
     def __init__(self, coordinator: PortainerCoordinator, stack: dict[str, Any]):
         super().__init__(coordinator)
         self._endpoint_id: int | str = stack["EndpointId"]
-        self._stack_id: int = stack["Id"]
+        self._stack_id: str = str(stack["Id"])
         self._stack_name: str = stack["Name"]
 
         self._attr_unique_id = (
@@ -691,6 +768,219 @@ class UpdateCheckSensor(PortainerSensor):
         await self.coordinator.async_request_refresh()
         self.async_write_ha_state()
         self.async_schedule_update_ha_state()
+
+
+# ---------------------------
+#   Stats sensors (CPU% / Memory): entity + factory
+# ---------------------------
+
+_ATTR_BY_SUFFIX: dict[str, str] = {
+    UNIQUE_SUFFIX_CPU_PCT: "cpu_percent",
+    UNIQUE_SUFFIX_MEM_MIB: "mem_used_mib",
+    UNIQUE_SUFFIX_MEM_PCT: "mem_percent",
+}
+
+
+class PortainerContainerStatsSensor(CoordinatorEntity[ContainerStatsCoordinator], SensorEntity):
+    """Per-container CPU/Mem sensor backed by a shared stats coordinator."""
+
+    _attr_has_entity_name = False
+
+    def __init__(
+        self,
+        *,
+        coordinator: ContainerStatsCoordinator,
+        metric_suffix: str,
+        endpoint_id: int | str,
+        container_name: str,
+        compose_stack: str,
+        compose_service: str,
+        name_mode: str,
+        state_getter: Optional[Callable[[], Any]] = None,
+        icon: Optional[str] = None,
+    ) -> None:
+        super().__init__(coordinator)
+
+        # Unique id mirrors ContainerSensor pattern (endpoint + container + key)
+        sensor_key = _sensor_key_for_suffix(metric_suffix)
+        self._attr_unique_id = f"{DOMAIN}_container_{endpoint_id}_{container_name}_{sensor_key}"
+
+        # Build name: "<suffix label>: <label-by-mode>"
+        base_label = _label_for_suffix(metric_suffix)
+        entity_label = _compute_entity_label_for(
+            container_name=container_name,
+            compose_stack=compose_stack,
+            compose_service=compose_service,
+            name_mode=name_mode,
+        )
+        self._attr_name = f"{base_label}: {entity_label}"
+
+        # Store identity for device_info and available()
+        self._endpoint_id = endpoint_id
+        self._container_name = container_name
+        self._compose_stack = compose_stack
+        self._compose_service = compose_service
+
+        # HA traits
+        self._attr_state_class = SensorStateClass.MEASUREMENT
+        if metric_suffix == UNIQUE_SUFFIX_CPU_PCT:
+            self._attr_device_class = SensorDeviceClass.POWER_FACTOR
+            self._attr_native_unit_of_measurement = PERCENTAGE
+        elif metric_suffix == UNIQUE_SUFFIX_MEM_MIB:
+            self._attr_device_class = SensorDeviceClass.DATA_SIZE
+            self._attr_native_unit_of_measurement = UnitOfInformation.MEBIBYTES
+        else:
+            self._attr_device_class = SensorDeviceClass.POWER_FACTOR
+            self._attr_native_unit_of_measurement = PERCENTAGE
+
+        # Icon: prefer description.icon (from sensor_types.py)
+        if icon:
+            self._attr_icon = icon
+        elif metric_suffix == UNIQUE_SUFFIX_CPU_PCT:
+            self._attr_icon = "mdi:cpu-64-bit"
+        else:
+            self._attr_icon = "mdi:memory"
+
+        self._metric_attr = _ATTR_BY_SUFFIX[metric_suffix]
+        self._state_getter = state_getter
+
+    @property
+    def available(self) -> bool:
+        # Mirror main-coordinator container state; fallback to coordinator availability
+        try:
+            if self._state_getter is not None:
+                state = self._state_getter()
+                return str(state).lower() in ("running", "restarting")
+            return super().available
+        except Exception:  # pragma: no cover
+            return super().available
+
+    @property
+    def native_value(self) -> float | int | None:
+        data = self.coordinator.data
+        if not data:
+            return None
+        value = getattr(data, self._metric_attr, None)
+        if self._metric_attr == "mem_used_mib" and isinstance(value, float):
+            return round(value, 2)
+        if isinstance(value, float):
+            return round(value, 3)
+        return value
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return container_device_info(
+            self._endpoint_id,
+            self._container_name,
+            self._compose_stack,
+            self._compose_service,
+        )
+
+
+def _container_stats_factory(
+    coordinator: PortainerCoordinator,
+    description: Any,
+    uid: str | None = None,
+):
+    """Dispatcher factory: create one stats sensor for a container."""
+    try:
+        if uid is None:
+            return None
+        cont: dict[str, Any] = coordinator.raw_data["containers"][uid]
+    except Exception:
+        return None
+
+    endpoint_id = cont.get("EndpointId")
+    container_name = cont.get("Name")
+    container_id = cont.get("Id") or uid
+    compose_stack = cont.get("Compose_Stack", "")
+    compose_service = cont.get("Compose_Service", "")
+
+    # Options from config entry (with defaults)
+    opts = coordinator.config_entry.options or {}
+    options = {
+        CONF_STATS_SCAN_INTERVAL: opts.get(CONF_STATS_SCAN_INTERVAL, DEFAULT_STATS_SCAN_INTERVAL),
+        CONF_STATS_SMOOTHING_ALPHA: opts.get(CONF_STATS_SMOOTHING_ALPHA, DEFAULT_STATS_SMOOTHING_ALPHA),
+        CONF_MEM_EXCLUDE_CACHE: opts.get(CONF_MEM_EXCLUDE_CACHE, DEFAULT_MEM_EXCLUDE_CACHE),
+    }
+
+    # Build/reuse stats coordinator (keyed by endpoint:name)
+    entry_id = coordinator.config_entry.entry_id
+    container_key = f"{endpoint_id}:{container_name}"
+    stats_coord: ContainerStatsCoordinator = get_or_create_container_stats_coordinator(
+        hass=coordinator.hass,
+        entry_id=entry_id,
+        api=coordinator.api,
+        endpoint_id=endpoint_id,
+        container_key=container_key,
+        container_id=container_id,
+        options=options,
+    )
+
+    # Determine which metric this description is for
+    key = getattr(description, "key", "") or ""
+    if key.endswith(UNIQUE_SUFFIX_CPU_PCT):
+        suffix = UNIQUE_SUFFIX_CPU_PCT
+    elif key.endswith(UNIQUE_SUFFIX_MEM_MIB):
+        suffix = UNIQUE_SUFFIX_MEM_MIB
+    else:
+        suffix = UNIQUE_SUFFIX_MEM_PCT
+
+    name_mode = opts.get(CONF_CONTAINER_SENSOR_NAME_MODE, DEFAULT_CONTAINER_SENSOR_NAME_MODE)
+
+    def _state_getter() -> Any:
+        key2 = f"{endpoint_id}:{container_name}"
+        return (coordinator.raw_data.get("containers_by_name", {}) or {}).get(key2, {}).get("State")
+
+    return PortainerContainerStatsSensor(
+        coordinator=stats_coord,
+        metric_suffix=suffix,
+        endpoint_id=endpoint_id,
+        container_name=container_name,
+        compose_stack=compose_stack,
+        compose_service=compose_service,
+        name_mode=name_mode,
+        state_getter=_state_getter,
+        icon=getattr(description, "icon", None),
+    )
+
+
+def _label_for_suffix(suffix: str) -> str:
+    if suffix == UNIQUE_SUFFIX_CPU_PCT:
+        return "CPU Usage (%)"
+    if suffix == UNIQUE_SUFFIX_MEM_MIB:
+        return "Memory Used (MiB)"
+    return "Memory Usage (%)"
+
+
+def _sensor_key_for_suffix(suffix: str) -> str:
+    # Make unique_id key stable and short
+    return {
+        UNIQUE_SUFFIX_CPU_PCT: "containers_cpu_pct",
+        UNIQUE_SUFFIX_MEM_MIB: "containers_mem_mib",
+        UNIQUE_SUFFIX_MEM_PCT: "containers_mem_pct",
+    }.get(suffix, suffix)
+
+
+def _compute_entity_label_for(
+    *,
+    container_name: str,
+    compose_stack: str,
+    compose_service: str,
+    name_mode: str,
+) -> str:
+    """Compute label identical to ContainerSensor._compute_entity_label."""
+    service = (compose_service or "").strip()
+    stack = (compose_stack or "").strip()
+
+    if name_mode == NAME_MODE_SERVICE:
+        return service or container_name
+    if name_mode == NAME_MODE_STACK_SERVICE:
+        if service and stack:
+            return f"{stack}/{service}"
+        return container_name
+    # NAME_MODE_CONTAINER (default)
+    return container_name
 
 
 # ---------------------------

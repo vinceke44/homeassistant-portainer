@@ -1,4 +1,3 @@
-# file: tests/test_switch_naming.py (mode-explicit)
 from types import SimpleNamespace
 
 from custom_components.portainer.switch import PortainerContainerSwitch

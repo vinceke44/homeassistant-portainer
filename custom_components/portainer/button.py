@@ -1,13 +1,13 @@
+# custom_components/portainer/button.py
 """Portainer button platform."""
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Iterable, List, Set
 
 from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers import entity_platform as ep
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -39,67 +39,71 @@ async def async_setup_entry(  # NOSONAR
     coordinator: PortainerCoordinator = hass.data[DOMAIN][config_entry.entry_id][
         "coordinator"
     ]
-
     control = PortainerControl(coordinator.api)
 
-    entities: list[ButtonEntity] = []
+    # Force Update Check button (always)
+    base_entities: list[ButtonEntity] = [
+        ForceUpdateCheckButton(coordinator, config_entry.entry_id)
+    ]
+    async_add_entities(base_entities, update_before_add=False)
 
-    # Always create the Force Update Check button
-    entities.append(ForceUpdateCheckButton(coordinator, config_entry.entry_id))
+    # Helper to build restart buttons for all known containers
+    def _build_restart_buttons() -> List[ButtonEntity]:
+        buttons: list[ButtonEntity] = []
+        containers_by_name = coordinator.raw_data.get("containers_by_name", {}) or {}
+        for c in containers_by_name.values():
+            try:
+                buttons.append(PortainerContainerRestartButton(coordinator, control, c))
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug(
+                    "Skipping restart button for container due to error: %s", err
+                )
+        return buttons
 
-    # Create a restart button per known container (stable by endpoint+name)
-    containers_by_name = coordinator.raw_data.get("containers_by_name", {})
-    for c in containers_by_name.values():
-        try:
-            entities.append(PortainerContainerRestartButton(coordinator, control, c))
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.debug("Skipping restart button for container due to error: %s", err)
+    # Initial pass: add any restart buttons now
+    restart_now = _build_restart_buttons()
+    if restart_now:
+        async_add_entities(restart_now, update_before_add=False)
+        _LOGGER.info("Added %d container restart buttons (initial)", len(restart_now))
 
-    if entities:
-        async_add_entities(entities, update_before_add=False)
+    # Keep track of what we’ve created (unique_ids) to avoid duplicates
+    created: Set[str] = {e.unique_id for e in base_entities + restart_now if e.unique_id}
 
     @callback
     async def _async_update_controller(_coordinator):
         """Dynamically add buttons for newly discovered containers."""
-        from homeassistant.helpers import entity_registry as er
-
-        entity_registry = er.async_get(hass)
-        existing = {
-            e.unique_id
-            for e in er.async_entries_for_config_entry(
-                entity_registry, config_entry.entry_id
-            )
-            if e.platform == DOMAIN
-        }
-
-        platform = ep.async_get_current_platform()
-        plat_entities = getattr(platform, "_entities", []) or []
-        existing.update({getattr(e, "unique_id", None) for e in plat_entities if getattr(e, "unique_id", None)})
-
         new_buttons: list[ButtonEntity] = []
-        for c in coordinator.raw_data.get("containers_by_name", {}).values():
-            uid = f"{DOMAIN}_container_restart_{c['EndpointId']}_{c['Name']}"
-            if uid in existing:
+        containers_by_name = coordinator.raw_data.get("containers_by_name", {}) or {}
+        for c in containers_by_name.values():
+            uid = f"{DOMAIN}_container_restart_{c.get('EndpointId')}_{c.get('Name')}"
+            if not uid or uid in created:
                 continue
             try:
-                new_buttons.append(PortainerContainerRestartButton(coordinator, control, c))
-                existing.add(uid)
+                btn = PortainerContainerRestartButton(coordinator, control, c)
+                new_buttons.append(btn)
+                created.add(uid)
             except Exception as err:  # noqa: BLE001
                 _LOGGER.debug("Skipping new restart button due to error: %s", err)
 
         if new_buttons:
-            _LOGGER.info("Adding %d new container restart buttons", len(new_buttons))
             async_add_entities(new_buttons, update_before_add=False)
+            _LOGGER.info("Added %d new container restart buttons", len(new_buttons))
 
+    # Listen for coordinator refreshes to add new buttons later
     config_entry.async_on_unload(
         async_dispatcher_connect(
             hass, f"{config_entry.entry_id}_update", _async_update_controller
         )
     )
 
+    # Ensure we run at least once after setup (in case first refresh beat us)
+    await _async_update_controller(coordinator)
+
 
 class ForceUpdateCheckButton(ButtonEntity):
     """Button to force immediate update check."""
+
+    _attr_should_poll = False  # Coordinator drives state; no polling
 
     def __init__(self, coordinator: PortainerCoordinator, entry_id: str) -> None:
         self.coordinator = coordinator
@@ -117,22 +121,23 @@ class ForceUpdateCheckButton(ButtonEntity):
 
     @property
     def device_info(self):
+        # Dedicated "System" device (no fragile via_device chain)
         return {
-            "identifiers": {
-                (DOMAIN, f"{self.coordinator.name}_System_{self.entry_id}")
-            },
+            "identifiers": {(DOMAIN, f"{self.coordinator.name}_System_{self.entry_id}")},
             "name": f"{self.coordinator.name} System",
             "manufacturer": "Portainer",
         }
 
     @property
     def available(self) -> bool:
+        # Avoid flapping: accept either connected or last_update_success
         feature_enabled = self.coordinator.config_entry.options.get(
             CONF_FEATURE_UPDATE_CHECK, DEFAULT_FEATURE_UPDATE_CHECK
         )
         feature_enabled = feature_enabled is True
-        coordinator_connected = self.coordinator.connected()
-        return feature_enabled and coordinator_connected
+        return feature_enabled and (
+            self.coordinator.connected() or getattr(self.coordinator, "last_update_success", False)
+        )
 
     @property
     def entity_registry_enabled_default(self) -> bool:
@@ -155,10 +160,12 @@ class PortainerContainerRestartButton(CoordinatorEntity, ButtonEntity):
     """Restart button for a container (compose-aware, stable-by-name).
 
     Entity label follows the same naming option as sensors:
-    - service (default)
+    - service (recommended)
     - container
-    - stack_service
+    - stack/service
     """
+
+    _attr_should_poll = False
 
     def __init__(
         self,
@@ -187,6 +194,7 @@ class PortainerContainerRestartButton(CoordinatorEntity, ButtonEntity):
 
     @property
     def available(self) -> bool:
+        # Available whenever the container is indexed (running or stopped).
         return self._resolve_current_container() is not None
 
     @property
@@ -222,7 +230,7 @@ class PortainerContainerRestartButton(CoordinatorEntity, ButtonEntity):
         return self._container_name
 
     def _resolve_current_container(self) -> dict[str, Any] | None:
-        containers_by_name = self.coordinator.raw_data.get("containers_by_name", {})
+        containers_by_name = self.coordinator.raw_data.get("containers_by_name", {}) or {}
         key = f"{self._endpoint_id}:{self._container_name}"
         found = containers_by_name.get(key)
         if found:

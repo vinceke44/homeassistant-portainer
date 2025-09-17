@@ -1,14 +1,12 @@
 {
-    "domain": "portainer",
-    "name": "Portainer",
-    "codeowners": [
-        "@vinceke44"
-    ],
-    "config_flow": true,
-    "dependencies": [],
-    "documentation": "https://github.com/vinceke44/homeassistant-portainer",
-    "iot_class": "local_polling",
-    "issue_tracker": "https://github.com/vinceke44/homeassistant-portainer/issues",
-    "requirements": [],
-    "version": "1.1.0"
+  "domain": "portainer",
+  "name": "Portainer",
+  "codeowners": ["@vinceke44"],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/vinceke44/homeassistant-portainer",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/vinceke44/homeassistant-portainer/issues",
+  "requirements": [],
+  "version": "1.2.0"
 }
