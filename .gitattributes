@@ -2,3 +2,9 @@
 .gitignore export-ignore
 .github export-ignore
 docs export-ignore
+
+# Normalize line endings in the repo to LF
+* text=auto eol=lf
+
+# Shell scripts: always LF
+*.sh text eol=lf
