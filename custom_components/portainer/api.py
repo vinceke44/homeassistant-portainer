@@ -1,26 +1,20 @@
 """Portainer API."""
-from __future__ import annotations
 
 from logging import getLogger
 from threading import Lock
 from typing import Any
 
 from requests import get as requests_get, post as requests_post
-from requests.exceptions import (
-    SSLError,
-    ConnectTimeout,
-    ReadTimeout,
-    ConnectionError as ReqConnectionError,
-    HTTPError,
-    RequestException,
-)
 
 from homeassistant.core import HomeAssistant
 
 _LOGGER = getLogger(__name__)
 
 
-class PortainerAPI:
+# ---------------------------
+#   PortainerAPI
+# ---------------------------
+class PortainerAPI(object):
     """Handle all communication with Portainer."""
 
     def __init__(
@@ -38,39 +32,44 @@ class PortainerAPI:
         self._api_key = api_key
         self._protocol = "https" if self._use_ssl else "http"
         self._ssl_verify = verify_ssl
-        # If not using SSL, verification flag is irrelevant but must be truthy for requests
         if not self._use_ssl:
             self._ssl_verify = True
-
         self._url = f"{self._protocol}://{self._host}/api/"
+
         self.lock = Lock()
         self._connected = False
-        self._error: str = ""
+        self._error = ""
 
+    # ---------------------------
+    #   connected
+    # ---------------------------
     def connected(self) -> bool:
         """Return connected boolean."""
         return self._connected
 
-    def connection_test(self) -> tuple[bool, str]:
+    # ---------------------------
+    #   connection_test
+    # ---------------------------
+    def connection_test(self) -> tuple:
         """Test connection."""
         self.query("endpoints")
         return self._connected, self._error
 
+    # ---------------------------
+    #   query
+    # ---------------------------
     def query(
         self, service: str, method: str = "get", params: dict[str, Any] | None = None
-    ) -> list | dict | None:
+    ) -> Any | None:
         """Retrieve data from Portainer."""
         if params is None:
             params = {}
-
         self.lock.acquire()
+        error = False
         response = None
-        data: list | dict | None = None
-        error_code: str | int | None = None
-
         try:
             _LOGGER.debug(
-                "Portainer %s query: service=%s, method=%s, params=%s",
+                "Portainer %s query: %s, %s, %s",
                 self._host,
                 service,
                 method,
@@ -81,7 +80,6 @@ class PortainerAPI:
                 "Content-Type": "application/json",
                 "X-API-Key": f"{self._api_key}",
             }
-
             if method == "get":
                 response = requests_get(
                     f"{self._url}{service}",
@@ -98,100 +96,85 @@ class PortainerAPI:
                     verify=self._ssl_verify,
                     timeout=10,
                 )
-            else:
-                _LOGGER.warning("Unsupported HTTP method: %s", method)
 
-            if response is not None:
-                # Raise for HTTP errors (4xx/5xx) to unify handling/logging
-                try:
-                    response.raise_for_status()
-                except HTTPError as http_err:
-                    error_code = response.status_code
-                    raise http_err
-
+            if response is not None and response.status_code == 200:
                 data = response.json()
                 _LOGGER.debug(
                     "Portainer %s query completed successfully for %s",
                     self._host,
                     service,
                 )
-                self._connected = True
-                self._error = ""
-                return data
+            else:
+                error = True
+        except Exception:
+            error = True
 
-            # Should not happen: no response object
-            error_code = "no_response"
-            raise RequestException("No response object returned")
-
-        except SSLError as err:
-            error_code = "ssl_error"
-            self._connected = False
-            _LOGGER.warning(
-                "Portainer %s SSL error fetching '%s': %s (verify_ssl=%s)",
-                self._host,
-                service,
-                err,
-                self._ssl_verify,
-            )
-        except (ConnectTimeout, ReadTimeout) as err:
-            error_code = "timeout"
-            self._connected = False
-            _LOGGER.warning(
-                "Portainer %s timeout fetching '%s': %s", self._host, service, err
-            )
-        except ReqConnectionError as err:
-            error_code = "conn_error"
-            self._connected = False
-            _LOGGER.warning(
-                "Portainer %s connection error fetching '%s': %s",
-                self._host,
-                service,
-                err,
-            )
-        except HTTPError as err:
-            # HTTP status already captured in error_code
-            self._connected = False
-            status = error_code if error_code is not None else "http_error"
-            _LOGGER.warning(
-                "Portainer %s HTTP error fetching '%s': %s (status=%s)",
-                self._host,
-                service,
-                err,
-                status,
-            )
-        except RequestException as err:
-            error_code = "request_error"
-            self._connected = False
-            _LOGGER.warning(
-                "Portainer %s request error fetching '%s': %s",
-                self._host,
-                service,
-                err,
-            )
-        except Exception as err:  # noqa: BLE001
-            error_code = error_code or "unknown_error"
-            self._connected = False
-            _LOGGER.warning(
-                "Portainer %s unexpected error fetching '%s': %s",
-                self._host,
-                service,
-                err,
-            )
-        finally:
-            # Ensure we always release the lock
-            self.lock.release()
-
-        # Normalize error_code surfaced to coordinator/diagnostics
-        if response is not None and error_code is None:
+        if error:
             try:
-                error_code = response.status_code
-            except Exception:  # noqa: BLE001
-                error_code = "no_response"
+                errorcode = (
+                    response.status_code if response is not None else "no_response"
+                )
+            except Exception:
+                errorcode = "no_response"
 
-        self._error = str(error_code)
-        return None
+            _LOGGER.warning(
+                'Portainer %s unable to fetch data "%s" (%s)',
+                self._host,
+                service,
+                errorcode,
+            )
+
+            if errorcode != 500 and service != "reporting/get_data":
+                self._connected = False
+
+            self._error = errorcode
+            self.lock.release()
+            return None
+
+        self._connected = True
+        self._error = ""
+        self.lock.release()
+
+        return data
+
+    # ---------------------------
+    #   get_container_stats
+    # ---------------------------
+    def get_container_stats(
+        self, *, endpoint_id: int | str, container_id: str
+    ) -> Any | None:
+        """One-shot Docker stats for a container (no stream, read-only).
+        IMPORTANT: This call MUST NOT toggle global connected state on per-container errors.
+        Returns JSON dict on 200, otherwise None.
+        """
+        service = f"endpoints/{endpoint_id}/docker/containers/{container_id}/stats"
+        url = f"{self._url}{service}"
+        headers = {
+            "Content-Type": "application/json",
+            "X-API-Key": f"{self._api_key}",
+        }
+        try:
+            resp = requests_get(
+                url,
+                headers=headers,
+                params={"stream": "false"},
+                verify=self._ssl_verify,
+                timeout=10,
+            )
+            if resp is not None and resp.status_code == 200:
+                return resp.json()
+            # Do NOT flip _connected here; per-container stats often 404/409 when stopped
+            _LOGGER.debug(
+                "Portainer stats non-200 for %s: %s",
+                container_id,
+                getattr(resp, "status_code", "no_response"),
+            )
+            return None
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("Portainer stats error for %s: %s", container_id, err)
+            return None
 
     @property
-    def error(self) -> str:
-        """Return last error code/reason."""
+    def error(self):
+        """Return error."""
         return self._error
