@@ -17,10 +17,10 @@ ATTRIBUTION = "Data provided by Portainer integration"
 
 SCAN_INTERVAL = 30
 
-DEFAULT_HOST = "10.0.0.1"
+DEFAULT_HOST = "portainer:9443"
 
 DEFAULT_DEVICE_NAME = "Portainer"
-DEFAULT_SSL = False
+DEFAULT_SSL = True
 DEFAULT_SSL_VERIFY = True
 
 # attributes used in the entity unique_id
@@ -36,6 +36,20 @@ TO_REDACT = {
 
 CUSTOM_ATTRIBUTE_ARRAY = "_Custom"
 
+
+# HTTP / Session / Retry settings
+HTTP_POOL_CONNECTIONS: int = 64          # per-host pool count
+HTTP_POOL_MAXSIZE: int = 128             # max concurrent conns per pool
+HTTP_CONNECT_TIMEOUT: int = 5            # seconds
+HTTP_READ_TIMEOUT: int = 10              # seconds
+
+# Retry policy for transient errors
+HTTP_RETRIES_TOTAL: int = 2
+HTTP_BACKOFF_FACTOR: float = 0.5
+HTTP_STATUS_FORCELIST: tuple[int, ...] = (429, 500, 502, 503, 504)
+
+
+
 # sensor naming mode
 CONF_CONTAINER_SENSOR_NAME_MODE = "container_sensor_name_mode"
 
@@ -44,6 +58,10 @@ NAME_MODE_CONTAINER = "container"       # always container name
 NAME_MODE_STACK_SERVICE = "stack_service"  # compose "stack/service"; fallback to container name
 
 DEFAULT_CONTAINER_SENSOR_NAME_MODE = NAME_MODE_SERVICE
+
+
+# Stats concurrency
+STATS_MAX_CONCURRENCY: int = 32
 
 
 # Stats polling options (stored in ConfigEntry.options)

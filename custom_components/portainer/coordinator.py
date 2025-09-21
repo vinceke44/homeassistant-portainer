@@ -131,6 +131,10 @@ class PortainerCoordinator(DataUpdateCoordinator):
                 self.lock.release()
             except RuntimeError:
                 pass
+        try:
+            self.api.close()
+        except Exception:
+            pass
 
     def connected(self) -> bool:
         return self.api.connected()
