@@ -658,14 +658,21 @@ class StackContainersSensor(CoordinatorEntity, SensorEntity):
         canonical_uid = f"{DOMAIN}_stack_containers_{self._endpoint_id}_{self._stack_slug}"
         legacy_uid = f"{DOMAIN}_stack_containers_{self._endpoint_id}_{self._stack_id}"
 
-        ent_reg = er.async_get(coordinator.hass)
+        # TEST-SAFE: only touch entity registry if coordinator has hass
         adopted_legacy = False
-        if ent_reg.async_get_entity_id("sensor", DOMAIN, legacy_uid):
-            self._attr_unique_id = legacy_uid
-            adopted_legacy = True
-            coordinator.hass.data[DOMAIN][_UID_ALIASES_KEY].add(canonical_uid)
-            _LOGGER.debug("Adopting legacy UID for stack '%s' (endpoint=%s): %s", self._stack_name, self._endpoint_id, legacy_uid)
+        if hasattr(coordinator, "hass") and coordinator.hass is not None:
+            ent_reg = er.async_get(coordinator.hass)
+            if ent_reg.async_get_entity_id("sensor", DOMAIN, legacy_uid):
+                self._attr_unique_id = legacy_uid
+                adopted_legacy = True
+                try:
+                    coordinator.hass.data[DOMAIN][_UID_ALIASES_KEY].add(canonical_uid)
+                except Exception:
+                    pass
+            else:
+                self._attr_unique_id = canonical_uid
         else:
+            # In tests (DummyCoord without hass), always choose canonical
             self._attr_unique_id = canonical_uid
 
         self._attr_name = f"Stack Containers: {self._stack_name}"

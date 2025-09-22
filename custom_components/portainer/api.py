@@ -35,6 +35,44 @@ from .const import (
 
 _LOGGER = getLogger(__name__)
 
+# -----------------------------------------------------------------------------
+# Global session + patchable callables for tests
+# -----------------------------------------------------------------------------
+# WHY:
+# - Single shared pool avoids "connection pool is full" warnings.
+# - Expose requests_get/requests_post at module scope to allow monkeypatching
+#   in unit tests: tests can do `monkeypatch.setattr(api, "requests_get", ...)`.
+requests_session: Session = requests.Session()
+try:
+    retry = Retry(
+        total=HTTP_RETRIES_TOTAL,
+        connect=HTTP_RETRIES_TOTAL,
+        read=HTTP_RETRIES_TOTAL,
+        backoff_factor=HTTP_BACKOFF_FACTOR,
+        status_forcelist=HTTP_STATUS_FORCELIST,
+        allowed_methods=frozenset({"GET", "POST"}),
+        raise_on_status=False,
+    ) if Retry is not None else None
+    adapter = HTTPAdapter(
+        pool_connections=HTTP_POOL_CONNECTIONS,
+        pool_maxsize=HTTP_POOL_MAXSIZE,
+        max_retries=retry or 0,
+    )
+    requests_session.mount("http://", adapter)
+    requests_session.mount("https://", adapter)
+except Exception:  # pragma: no cover
+    pass
+
+
+def requests_get(url: str, **kwargs):
+    """Patchable GET used by PortainerAPI."""
+    return requests_session.get(url, **kwargs)
+
+
+def requests_post(url: str, **kwargs):
+    """Patchable POST used by PortainerAPI."""
+    return requests_session.post(url, **kwargs)
+
 
 class PortainerAPI:
     """Handle all communication with Portainer."""
@@ -61,37 +99,15 @@ class PortainerAPI:
         self._error: str = ""
         self._fail_counts: dict[str, int] = {}
 
-        # Reusable HTTP session with larger pools + retry/backoff
-        self._session: Session = requests.Session()
-        try:
-            retry = Retry(
-                total=HTTP_RETRIES_TOTAL,
-                connect=HTTP_RETRIES_TOTAL,
-                read=HTTP_RETRIES_TOTAL,
-                backoff_factor=HTTP_BACKOFF_FACTOR,
-                status_forcelist=HTTP_STATUS_FORCELIST,
-                allowed_methods=frozenset({"GET", "POST"}),
-                raise_on_status=False,
-            ) if Retry is not None else None
-            adapter = HTTPAdapter(
-                pool_connections=HTTP_POOL_CONNECTIONS,
-                pool_maxsize=HTTP_POOL_MAXSIZE,
-                max_retries=retry or 0,
-            )
-            self._session.mount("http://", adapter)
-            self._session.mount("https://", adapter)
-        except Exception:  # pragma: no cover
-            pass
+        # Use the global session; do not own/close it here.
+        self._session: Session = requests_session
 
         # Global throttle for stats calls to reduce burstiness
         self._stats_sem = Semaphore(STATS_MAX_CONCURRENCY)
 
     def close(self) -> None:
-        """Close underlying HTTP session (release pools/sockets)."""
-        try:
-            self._session.close()
-        except Exception:  # pragma: no cover
-            pass
+        """No-op: global session is shared; do not close it here."""
+        return
 
     def connected(self) -> bool:
         return self._connected
@@ -115,7 +131,7 @@ class PortainerAPI:
             _LOGGER.debug("Portainer %s %s %s params=%s", self._host, method.upper(), service, params)
             try:
                 if method == "get":
-                    resp = self._session.get(
+                    resp = requests_get(
                         url,
                         headers=headers,
                         params=params,
@@ -123,7 +139,7 @@ class PortainerAPI:
                         timeout=(HTTP_CONNECT_TIMEOUT, HTTP_READ_TIMEOUT),
                     )
                 elif method == "post":
-                    resp = self._session.post(
+                    resp = requests_post(
                         url,
                         headers=headers,
                         json=params,
@@ -189,7 +205,7 @@ class PortainerAPI:
         }
         with self._stats_sem:
             try:
-                resp = self._session.get(
+                resp = requests_get(
                     url,
                     headers=headers,
                     params={"stream": "false"},
